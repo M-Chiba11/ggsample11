@@ -47,6 +47,11 @@ const GgSimpleShader::Material shadowMaterial
 // ワールド座標系の光源位置
 const GgVector lp{ 0.0f, 4.0f, 0.0f, 1.0f };
 
+// ワールド座標系の光源の目標位置
+const GLfloat lt[]{
+  0.0f, 0.0f, 0.0f, 1.0f
+};
+
 // アニメーションの変換行列を求める
 static GgMatrix animate(GLfloat t, int i)
 {
@@ -64,6 +69,9 @@ int GgApp::main(int argc, const char* const* argv)
 {
   // ウィンドウを作成する (この行は変更しないでください)
   Window window{ argc > 1 ? argv[1] : PROJECT_NAME, dWidth, dHeight };
+
+  // ウィンドウサイズの変更の抑制
+  glfwSetWindowSizeLimits(window.get(), dWidth, dHeight, GLFW_DONT_CARE, GLFW_DONT_CARE);
 
   // プログラムオブジェクトの作成
   GgSimpleShader shader{ PROJECT_NAME ".vert", PROJECT_NAME ".frag" };
@@ -94,6 +102,26 @@ int GgApp::main(int argc, const char* const* argv)
     objectMaterialBuffer.loadAmbientAndDiffuse(r, g, b, 1.0f, i);
   }
 
+  // デプステクスチャの作成
+  GLuint dtex;
+  glGenTextures(1, &dtex);
+  glBindTexture(GL_TEXTURE_2D, dtex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, dWidth, dHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 0);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+  // テクスチャ座標値z成分とデプステクスチャとの比較を行うようにする
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+
+  // もし値がテクスチャの値以下なら日向になる
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+
+  // デプステクスチャを一時保存するメモリの確保
+  std::unique_ptr<GLfloat> depth(new GLfloat[dWidth * dWidth]);
+
+
   // ビュー変換行列を mv に求める
   const auto mv{ ggLookat(0.0f, 3.0f, 8.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f) };
 
@@ -103,6 +131,9 @@ int GgApp::main(int argc, const char* const* argv)
 
   // 視点座標系の光源位置を求める
   light.position = mv * lp;
+
+  // 光源座標系の光源位置を光源データに設定
+  mv.projection(light.position, lp);
 
   // 光源
   const GgSimpleShader::LightBuffer lightBuffer{ light };
@@ -119,7 +150,26 @@ int GgApp::main(int argc, const char* const* argv)
       0.0f,   0.0f,   1.0f,   0.0f,
       0.0f,   0.0f,   0.0f,   1.0f
   };
-  const GgMatrix ms{ m };
+  // 影付け処理用の視野変換行列を求める
+  const auto mvs{ ggLookat(
+    lp[0], lp[1], lp[2],
+    lt[0], lt[1], lt[2],
+    0.0f, 0.0f, 1.0f
+  )
+  };
+
+  // 影付け処理用の投影変換行列を求める
+  const GgMatrix mps{
+    ggPerspective(1.5f, 1.0f, 1.0f, 5.0f)
+  };
+
+  // 影付け処理用の変換行列を求める
+  const GgMatrix ms{mps * mvs};
+
+  // デプステクスチャのサンプラの uniform 変数の場所を取り出す
+  const auto depthLoc{ glGetUniformLocation(shader.get(), "depth") };
+  // シャドウマップ用の変換行列の uniform 変数の場所を取り出す
+  const auto msLoc{ glGetUniformLocation(shader.get(), "ms") };
 
   //
   // その他の設定
@@ -146,6 +196,40 @@ int GgApp::main(int argc, const char* const* argv)
 
     // シェーダプログラムの使用開始
     shader.use(lightBuffer);
+
+    // ビューポートをデプステクスチャのサイズに合わせる
+    glViewport(0, 0, dWidth, dHeight);
+
+    // デプスバッファのみ消去
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    // デプステクスチャの作成
+    for (int i = 1; i <= objects; ++i)
+    {
+      // アニメーションの変換行列
+      const auto ma{ animate(t, i) };
+
+      // 遮蔽物の描画
+      shader.loadMatrix(mps, mvs * ma);
+      object->draw();
+    }
+
+    // デプスバッファの読み込み
+    glReadPixels(0, 0, dWidth, dHeight, GL_DEPTH_COMPONENT, GL_FLOAT, depth.get());
+
+    // デプステクスチャに転送
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, dtex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dWidth, dHeight, GL_DEPTH_COMPONENT, GL_FLOAT, depth.get());
+
+    // デプステクスチャのテクスチャユニットの指定
+    glUniform1i(depthLoc, 0);
+
+    // シャドウマップ用の変換行列の設定
+    glUniformMatrix4fv(msLoc, 1, GL_FALSE, ms.get());
+
+    // ビューポートをウィンドウのサイズに合わせる
+    glViewport(0, 0, window.getWidth(), window.getHeight());
 
     // 画面消去
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -176,7 +260,7 @@ int GgApp::main(int argc, const char* const* argv)
 
       // 影の描画 (楕円は XY 平面上にあるので X 軸中心に -π/2 回転)
       //   【宿題】楕円の代わりに影を落とす図形そのものを描く (-π/2 回転は不要)
-      shader.loadModelviewMatrix(mv * ms * ma * ggRotateX(-1.570796f));
+      shader.loadModelviewMatrix(mv * ms * ma);
       ellipse->draw();
     }
     glEnable(GL_DEPTH_TEST);
